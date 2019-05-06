@@ -1,0 +1,441 @@
+---
+title: "Project Models"
+author: "Sam Edds, Olivia Hackworth, Katherine Wilkinson"
+date: "4/28/2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+setwd('/Users/maraudersmap/Desktop/Bayes')
+```
+
+Libraries
+```{r}
+
+library(knitr); library(rstanarm); library(data.table); library(ggplot2); library(dplyr)
+library(corrplot); library(rstan)
+
+```
+
+
+## Read in Cleaned Data
+
+```{r}
+bechdel =fread("bechdel_cleaned.csv")
+```
+
+
+
+# Hierarchical Models
+
+
+Stan File Run for both Models:
+
+```{r}
+
+data {
+  int<lower=0> J; // number of decades/genres
+  int<lower=0> n[J]; // number of movies in each decade/genre 
+  int<lower=0> y[J]; // number of passed movies in each decade/genre
+}
+parameters {
+  real<lower=0> alpha; 
+  real<lower=0> beta;
+  real<lower=0, upper=1> theta[J];
+}
+
+model{
+  target += log(alpha + beta)*(-2.5); // hyperprior of alpha and beta
+  target += beta_lpdf(theta | alpha, beta); // prior of theta
+  target += binomial_lpmf(y | n, theta); // likelihood of observations
+}
+```
+
+## By Decade:
+
+```{r}
+
+bechdel = bechdel %>% dplyr::select(-News)
+bechdel_pf = bechdel[,lapply(.SD, sum), by = decade, .SDcols = c('pass')]
+bechdel_pf[, total := bechdel[,.N, by = decade]$N]
+
+# y_i will be the number of movies that passed in decade_i
+y = bechdel_pf$pass
+# n_i will be the number of moves in decade_i
+n = bechdel_pf$total
+J = 10
+```
+
+### Marginal Density of $\alpha$ and $\beta$
+
+
+```{r}
+A <- seq(0.5, 70, length.out = 100) ## alpha
+B <- seq(0.5, 65, length.out = 100) ## beta
+
+cA <- rep(A, each = length(B))
+cB <- rep(B, length(A))
+
+# Use logarithms for numerical accuracy!
+lpfun <- function(a, b, y, n) log(a+b)*(-5/2) +
+  sum(lgamma(a+b)-lgamma(a)-lgamma(b)+lgamma(a+y)+lgamma(b+n-y)-lgamma(a+b+n))
+
+lp <- mapply(lpfun, cA, cB, MoreArgs = list(y, n))
+df_marg <- data.frame(x = cA, y = cB, p = exp(lp - max(lp)))
+
+# Subtract maximum value to avoid over/underflow in exponentation
+title1 <- 'The marginal posterior of alpha and beta by decade'
+# create a plot of the marginal posterior density
+postdensityalphabeta = ggplot(data = df_marg, aes(x = x, y = y)) +
+  geom_raster(aes(fill = p, alpha = p), interpolate = T) +
+  geom_contour(aes(z = p), colour = 'black', size = 0.2) +
+  coord_cartesian(xlim = c(0,50), ylim = c(0, 50)) +
+  labs(x = 'alpha', y = 'beta', title = title1) +
+  scale_fill_gradient(low = 'yellow', high = 'red', guide = F) +
+  scale_alpha(range = c(0, 1), guide = F)
+
+postdensityalphabeta
+
+```
+
+### Run model
+
+
+```{r}
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+bechdel_data = list(J = 10, y = y, n = n)
+
+fit = stan(file = 'bechdel.stan', data = bechdel_data, iter = 1000, chains = 4)
+
+```
+
+### Results
+
+##### Plot the posterior samples and $\alpha$ and $\beta$
+
+```{r}
+post = extract(fit)
+post_a = post$alpha
+post_b = post$beta
+post_ab = as.data.frame(cbind(post_a, post_b) )
+
+ggplot(data = post_ab, aes(x = post_a, y = post_b)) + geom_point(alpha = 0.3) +
+  labs(x = 'alpha', y = 'beta', title ='Posterior Samples of alpha and beta by Decade' ) 
+```
+
+
+##### Plot the 95% confidence intervals with estimates vs raw points
+
+```{r}
+
+post_theta = post$theta
+postintervals_sample <- apply(post_theta, 2,
+                              function(x) c(median(x), 
+                                            c(quantile(x, c(0.025, 0.975)))))
+
+rawest <- jitter(y/ n)
+
+bechdel_pf[,rawest := jitter(pass / total)]
+bechdel_pf[, estimate := postintervals_sample[1,] ]
+bechdel_pf[, `:=` (lower = postintervals_sample[2,], 
+                   upper = postintervals_sample[3,] )]
+
+library(ggrepel)
+
+ggplot(bechdel_pf, aes(x = rawest, y = estimate)) + 
+  geom_point() + 
+  geom_segment(aes(x=rawest, xend = rawest, 
+                   y=lower, yend=upper), colour="purple") +
+  geom_abline(yintercept = 0, slope = 1, color = 'dark grey') + 
+  #geom_text(aes(label = decade), nudge_y = 0.01)
+  geom_label_repel(data = bechdel_pf[rawest  < 0.485,],
+    aes(label = decade) ,
+                   segment.size = 0.5,
+                    nudge_y = 0.13,
+                   nudge_x = -0.05,
+                   segment.alpha = 0.3,
+                   label.size = 0.03,
+                   force = 1.1,
+                   size = 3
+                   ) +
+    geom_label_repel(data = bechdel_pf[rawest  > 0.485,],
+    aes(label = decade) ,
+                   segment.size = 0.5,
+                    nudge_y = -0.15,
+                   nudge_x = 0.05,
+                   segment.alpha = 0.3,
+                   label.size = 0.03,
+                   force = 1.1,
+                   size = 3
+                   ) +
+  labs(x = 'Raw Proportion', y = 'Posterior Interval') 
+
+```
+
+
+
+## By Genre:
+
+Check Correlation of Genres
+```{r}
+bechdel_g = bechdel[,8:30]
+corrplot(cor(bechdel_g))
+
+#cor(bechdel_g)
+cor_df = data.frame(cor(bechdel_g))
+cor_df
+
+```
+
+
+### Posterior Density of $\alpha$ and $\beta$
+
+```{r}
+bechdel =fread("bechdel_cleaned.csv")
+bechdel = bechdel %>% dplyr::select(-News)
+genres = colnames(bechdel[,8:29])
+
+genre_long = melt(bechdel, id.vars = c('imdbid','primaryTitle',
+                                       'year','rating','decade',
+                                       'pass'), 
+                 measure.vars = genres)
+
+genre_long = genre_long[value == 1,]
+
+genre_pf = genre_long[,lapply(.SD, sum), by = variable, 
+                      .SDcols = c('pass')]
+genre_pf[, total := genre_long[,.N, by = variable]$N]
+
+
+# y_i will be the number of movies that passed in genre_i
+y = genre_pf$pass
+# n_i will be the number of moves in genre_i
+n = genre_pf$total
+J = 22
+
+```
+
+
+### Marginal Density of $\alpha$ and $\beta$
+
+
+```{r}
+
+A <- seq(0.5, 40, length.out = 100) ## alpha
+B <- seq(0.5, 40, length.out = 100) ## beta
+
+
+cA <- rep(A, each = length(B))
+cB <- rep(B, length(A))
+
+# Use logarithms for numerical accuracy!
+lpfun <- function(a, b, y, n) log(a+b)*(-5/2) +
+  sum(lgamma(a+b)-lgamma(a)-lgamma(b)+lgamma(a+y)+
+        lgamma(b+n-y)-lgamma(a+b+n))
+
+lp <- mapply(lpfun, cA, cB, MoreArgs = list(y, n))
+df_marg <- data.frame(x = cA, y = cB, 
+                      p = exp(lp - max(lp)))
+
+
+# Subtract maximum value to avoid over/underflow in exponentation
+title1 <- 'The marginal posterior of alpha and beta by genre'
+# create a plot of the marginal posterior density
+postdensityalphabeta = ggplot(data = df_marg, aes(x = x, y = y)) +
+  geom_raster(aes(fill = p, alpha = p), interpolate = T) +
+  geom_contour(aes(z = p), colour = 'black', size = 0.2) +
+  coord_cartesian(xlim = c(0,40), ylim = c(0, 40)) +
+  labs(x = 'alpha', y = 'beta', title = title1) +
+  scale_fill_gradient(low = 'yellow', high = 'red', guide = F) +
+  scale_alpha(range = c(0, 1), guide = F)
+
+postdensityalphabeta
+
+```
+
+
+### Run Model
+
+
+```{r}
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+genre_data = list(J = 22, y = y, n = n)
+
+fit = stan(file = 'bechdel.stan', data = genre_data, 
+           iter = 1000, chains = 4)
+
+```
+
+
+### Results
+
+##### Plot the posterior samples and $\alpha$ and $\beta$
+
+
+```{r}
+
+post = extract(fit)
+post_a = post$alpha
+post_b = post$beta
+post_ab = as.data.frame(cbind(post_a, post_b) )
+plot(post_ab, xlab = 'alpha', ylab = 'beta')
+
+ggplot(data = post_ab, aes(x = post_a, y = post_b)) + 
+  geom_point(alpha = 0.3) +
+  labs(x = 'alpha', y = 'beta', 
+       title ='Posterior Samples of alpha and beta by Genre' ) 
+```
+
+##### Plot the 95% confidence intervals with estimates vs raw points
+
+
+
+```{r}
+
+post_theta = post$theta
+postintervals_sample <- apply(post_theta, 2,
+                              function(x) c(median(x), c(quantile(x, c(0.025, 0.975)))))
+
+rawest <- jitter(y / n)
+
+genre_pf[,rawest := jitter(pass / total)]
+genre_pf[, estimate := postintervals_sample[1,] ]
+genre_pf[, `:=` (lower = postintervals_sample[2,], 
+                   upper = postintervals_sample[3,] )]
+
+ggplot(genre_pf, aes(x = rawest, y = estimate)) + 
+  geom_point() + 
+  geom_segment(aes(x=rawest, xend = rawest, 
+                   y=lower, yend=upper), colour="blue") +
+  geom_abline(yintercept = 0, slope = 1, color = 'dark grey') + 
+  #geom_text(aes(label = decade), nudge_y = 0.01)
+  geom_label_repel(data  = subset(genre_pf, rawest < 0.55),
+    aes(label = variable) ,
+                   segment.size = 0.5,
+                    nudge_y = 0.1,
+                   nudge_x = -0.03,
+                   segment.alpha = 0.3,
+                   label.size = 0.03,
+                   force = 1.1,
+                   size = 2
+                   ) +
+    geom_label_repel(data  = subset(genre_pf, rawest >= 0.55),
+    aes(label = variable) ,
+                   segment.size = 0.5,
+                    nudge_y = -0.15,
+                   nudge_x = 0.03,
+                   segment.alpha = 0.3,
+                   label.size = 0.03,
+                   force = 1.1,
+                   size = 2
+                   ) +
+  labs(x = 'Raw Proportion', y = 'Posterior Interval') 
+```
+
+
+## Hierarchical Regression Model
+
+### Randomly Select Genre for each Unique Movie
+
+```{r}
+
+bechdel = fread('bechdel_cleaned.csv')
+id_count = bechdel[, .N, by = imdbid]
+genre_check = bechdel[, genre_cnt := sum(bechdel[,8:30])]
+
+genres = colnames(bechdel[,8:30])
+genre_long = melt(bechdel, 
+                  id.vars = c('imdbid','primaryTitle',
+                              'year','rating','decade'), 
+                 measure.vars = genres)
+
+
+check = genre_long[,lapply(.SD, sum),
+                   .SDcols = c('value'), by = c('imdbid')]
+
+check = check[value ==0,]
+
+check_ids = check$imdbid
+genre_long = genre_long[value == 1,]
+
+genre_long = genre_long[variable != 'News',]
+genre_long$genre = genre_long$variable
+genre_long$pass = ifelse(genre_long$rating == 3, 1, 0)
+genre_long$notpass = ifelse(genre_long$pass == 1, 0, 1)
+
+set.seed(123)
+uniq_id = unique(genre_long$imdbid)
+
+df = genre_long[imdbid == uniq_id[1],]
+uniq_df = df[sample(nrow(df),1),]
+
+for(i in 2:length(uniq_id) ){
+
+  df = genre_long[imdbid == uniq_id[i],]
+  rs = df[sample(nrow(df),1),]
+  
+
+  uniq_df = rbind(uniq_df, rs)
+
+  
+}
+
+g_cnt = genre_long[,.N, by = genre][,full_count := N][,.(genre, full_count)]
+ug_cnt = uniq_df[,.N, by = genre][, uniq_count := N][,.(genre, uniq_count)]
+cnt = merge(g_cnt, ug_cnt, by = 'genre')
+
+cnt[,diff := full_count - uniq_count]
+cnt[order(-uniq_count),]
+
+#fwrite(uniq_df, 'genre_unique.csv')
+```
+
+### Run Model and Output Results in kable table
+
+```{r}
+# Read
+bechdel = read.csv("genre_unique.csv")
+# Center and scale
+bechdel$scaleyear = scale(bechdel$year)
+
+# Run model
+mod4 <- stan_glmer(pass ~ (1 + scaleyear | genre),
+                              data = bechdel,
+                              family = binomial(link = "logit"), 
+                              prior_intercept = normal(),
+                              prior = normal(),
+                              chains = 4, cores = 2)
+# Store unique genre
+genre_unique = unique(bechdel$genre)
+
+# Make into a dataframe with genre
+coeffs <- data.frame(t(mod4$coefficients))
+even_indexes<-seq(3,45,2)
+betas_genre <- data.frame(transf_betas = t(coeffs[even_indexes]), 
+                          genre = genre_unique)
+rownames(betas_genre) = NULL
+
+# Prepare to unscale betas
+scale_cent = mean(bechdel$year)
+scale_sd = sd(bechdel$year)
+
+# Unscale betas
+betas_genre$betas <- exp(betas_genre$transf_betas) / scale_sd
+betas_genre$betas = round(betas_genre$betas, digits = 4)
+
+# Make into kable table
+beta_genres_final <- betas_genre %>% dplyr::select(-transf_betas)
+colnames(beta_genres_final) <- c("Genre", "Beta")
+beta_genres_final <- beta_genres_final[order(beta_genres_final$Beta),]
+kable(beta_genres_final)
+```
+
+
